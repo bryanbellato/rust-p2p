@@ -13,3 +13,5 @@ path = "src/lib.rs"
 
 [dependencies]
 threadpool = "1.8"
+serde_json = "1"
+rust-blockchain = { path = "../blockchain/rust-blockchain" }
