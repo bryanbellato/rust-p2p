@@ -50,3 +50,8 @@ You can also start a third node bootstrapping to the second node IP:PORT.
 Messages are sent as plain text over TCP with a simple header (`PORT:MESSAGE_CONTENT`)
 
 When a node receives this, it parses the `PORT` to know where the sender is listening. Then, it registers the sender's IP and Port in its internal directory (`known_hosts`).  Finally, it prints the `MESSAGE_CONTENT` to the console.
+
+## What's the meaning for each branch?
+`master` is the primary stable branch. 
+`standalone` is the independent P2P messenger network.
+`blockchain` is the P2P network integrated with blockchain protocols.
