@@ -19,7 +19,12 @@ fn main() {
             }
             "--bootstrap" => {
                 if let Some(b) = args.get(i + 1) {
-                    bootstrap = Some(b.parse().expect("Invalid bootstrap address (use IP:PORT)"));
+                    use std::net::ToSocketAddrs;
+                    let addr = b.to_socket_addrs()
+                        .expect("Failed to resolve bootstrap address")
+                        .next()
+                        .expect("No address found");
+                    bootstrap = Some(addr);
                     i += 1;
                 }
             }

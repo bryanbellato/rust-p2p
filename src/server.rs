@@ -1,5 +1,5 @@
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+use std::net::TcpListener;
 
 pub struct Server {
     pub listener: TcpListener,
@@ -7,9 +7,10 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(interface: Ipv4Addr, port: u16) -> io::Result<Self> {
-        let address = SocketAddrV4::new(interface, port);
-        let listener = TcpListener::bind(address)?;
+    pub fn new(port: u16) -> io::Result<Self> {
+        let listener = TcpListener::bind(format!("[::]:{}", port))
+            .or_else(|_| TcpListener::bind(format!("0.0.0.0:{}", port)))?;
+            
         println!("[SERVER] Listening on port {}", port);
         Ok(Server { listener, port })
     }

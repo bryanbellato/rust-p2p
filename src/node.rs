@@ -7,7 +7,6 @@ use rust_blockchain::{
     Message,
 };
 use std::io::{self, BufRead, BufReader, Write};
-use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -87,7 +86,7 @@ fn server_thread(
     known_hosts: SharedHosts,
     port: u16,
 ) -> io::Result<()> {
-    let server = Server::new(Ipv4Addr::new(0, 0, 0, 0), port)?;
+    let server = Server::new(port)?;
     let pool = ThreadPool::new(50);
 
     for stream in server.listener.incoming() {
@@ -292,55 +291,40 @@ fn startup_sync(known_hosts: &SharedHosts, blockchain: &SharedBlockchain, my_por
         return;
     }
 
-    println!(
-        "[SYNC] Starting up — syncing chain with {} known peer(s)...",
-        peers.len()
-    );
+    println!("[SYNC] Starting up — syncing chain with {} known peer(s)...", peers.len());
 
     for (ip, peer_port) in &peers {
-        match ip.parse::<Ipv4Addr>() {
-            Ok(addr) => {
-                // announce our listening port so the peer can register us
-                let ping = Message::Ping { port: my_port };
-                if let Some(reply) = send_to_peer(addr, *peer_port, &ping) {
-                    println!("[SYNC] Ping → {}:{} got {:?}", ip, peer_port, reply);
-                }
+        let ping = Message::Ping { port: my_port };
+        if let Some(reply) = send_to_peer(ip, *peer_port, &ping) {
+            println!("[SYNC] Ping → {}:{} got {:?}", ip, peer_port, reply);
+        }
 
-                // request their chain; the response handler will call
-                let req = Message::RequestChain;
-                if let Some(reply) = send_to_peer(addr, *peer_port, &req) {
-                    if let Message::ChainResponse { blocks, length } = reply {
-                        println!(
-                            "[SYNC] Got chain from {}:{} with {} block(s)",
-                            ip, peer_port, length
-                        );
-                        let mut bc = blockchain.write().unwrap();
-                        if bc.replace_chain_bootstrap(blocks) {
-                            println!(
-                                "[SYNC] Adopted network chain — genesis: {}...",
-                                &bc.chain()[0].hash()[..16]
-                            );
-                        } else {
-                            println!("[SYNC] Our chain is already up to date.");
-                        }
-                    }
+        let req = Message::RequestChain;
+        if let Some(reply) = send_to_peer(ip, *peer_port, &req) {
+            if let Message::ChainResponse { blocks, length } = reply {
+                println!("[SYNC] Got chain from {}:{} with {} block(s)", ip, peer_port, length);
+                let mut bc = blockchain.write().unwrap();
+                if bc.replace_chain_bootstrap(blocks) {
+                    println!("[SYNC] Adopted network chain — genesis: {}...", &bc.chain()[0].hash()[..16]);
+                } else {
+                    println!("[SYNC] Our chain is already up to date.");
                 }
             }
-            Err(_) => eprintln!("[SYNC] Invalid peer IP: {}", ip),
         }
     }
 }
 
 // send a single message to a specific peer and return the decoded response
 // returns None on any network or encoding error
-fn send_to_peer(addr: Ipv4Addr, port: u16, msg: &Message) -> Option<Message> {
+fn send_to_peer(host: &str, port: u16, msg: &Message) -> Option<Message> {
     let payload = encode(msg).ok()?;
     let payload_str = String::from_utf8_lossy(&payload).to_string();
     let client = Client::new(port);
-    match client.request(addr, &payload_str) {
+    
+    match client.request(host, &payload_str) {
         Ok(response) => decode(response.trim_end().as_bytes()).ok(),
         Err(e) => {
-            eprintln!("[SYNC] ERROR: {}:{} — {}", addr, port, e);
+            eprintln!("[SYNC] ERROR: {}:{} — {}", host, port, e);
             None
         }
     }
@@ -593,19 +577,16 @@ fn broadcast(known_hosts: &SharedHosts, msg: &Message, my_port: u16) {
 
     for (ip, peer_port) in &peers {
         let client = Client::new(*peer_port);
-        match ip.parse::<Ipv4Addr>() {
-            Ok(addr) => match client.request(addr, &payload_str) {
-                Ok(response) => match decode(response.trim_end().as_bytes()) {
-                    Ok(Message::Pong { port }) if port != 0 => {
-                        println!("[CLIENT] ← {}:{} Pong (their port: {})", ip, peer_port, port);
-                        register_host(known_hosts, ip.clone(), port);
-                    }
-                    Ok(reply) => println!("[CLIENT] ← {}:{} {:?}", ip, peer_port, reply),
-                    Err(_)    => println!("[CLIENT] ← {}:{} (raw) {}", ip, peer_port, response),
-                },
-                Err(e) => eprintln!("[CLIENT] ERROR: {}:{} {}", ip, peer_port, e),
+        match client.request(ip, &payload_str) {
+            Ok(response) => match decode(response.trim_end().as_bytes()) {
+                Ok(Message::Pong { port }) if port != 0 => {
+                    println!("[CLIENT] ← {}:{} Pong (their port: {})", ip, peer_port, port);
+                    register_host(known_hosts, ip.clone(), port);
+                }
+                Ok(reply) => println!("[CLIENT] ← {}:{} {:?}", ip, peer_port, reply),
+                Err(_)    => println!("[CLIENT] ← {}:{} (raw) {}", ip, peer_port, response),
             },
-            Err(_) => eprintln!("[CLIENT] Invalid IP: {}", ip),
+            Err(e) => eprintln!("[CLIENT] ERROR: {}:{} {}", ip, peer_port, e),
         }
     }
     let _ = my_port;
