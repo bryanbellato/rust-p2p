@@ -32,8 +32,8 @@ fn main() {
     let miner_address = keypair.get_public_key().to_string();
     println!("[NODE] Identity: {}...", &miner_address[..20]);
 
-    // difficulty=4, reward=50 coins, min_fee_rate=10 sat/byte
-    let blockchain = Blockchain::new(4, 50.0, 10, miner_address.clone());
+    // difficulty=5, reward=50 coins, min_fee_rate=10 sat/byte
+    let blockchain = Blockchain::new(5, 50.0, 10, miner_address.clone());
 
     let node = Node::new(port, keypair, blockchain);
 

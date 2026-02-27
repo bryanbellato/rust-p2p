@@ -63,7 +63,7 @@ impl Node {
             Arc::clone(&self.mempool),
             self.port,
             Arc::clone(&self.is_mining),
-            self.keypair.get_public_key().to_string(),
+            self.keypair.clone(),
         );
     }
 }
@@ -340,7 +340,7 @@ fn send_to_peer(addr: Ipv4Addr, port: u16, msg: &Message) -> Option<Message> {
     match client.request(addr, &payload_str) {
         Ok(response) => decode(response.trim_end().as_bytes()).ok(),
         Err(e) => {
-            eprintln!("[SYNC] ✗ {}:{} — {}", addr, port, e);
+            eprintln!("[SYNC] ERROR: {}:{} — {}", addr, port, e);
             None
         }
     }
@@ -352,10 +352,10 @@ fn client_loop(
     mempool: SharedMempool,
     my_port: u16,
     is_mining: Arc<AtomicBool>,
-    miner_address: String,
+    keypair: KeyPair,
 ) {
     let stdin = io::stdin();
-    println!("[CLIENT] Ready. Commands: ping | mine | chain | inventory | mempool | quit");
+    println!("[CLIENT] Ready. Commands: send <to> <amount> | mine | whoami | ping | chain | inventory | mempool | quit");
 
     for line in stdin.lock().lines() {
         let input = match line {
@@ -366,24 +366,55 @@ fn client_loop(
             continue;
         }
 
-        match input.as_str() {
+        let (cmd, rest) = match input.split_once(' ') {
+            Some((c, r)) => (c, r.trim()),
+            None         => (input.as_str(), ""),
+        };
+
+        match cmd {
             "quit" => break,
 
+            "whoami" => {
+                let addr = keypair.get_public_key();
+                println!("[NODE] Your address: {}", addr);
+                let bc = blockchain.read().unwrap();
+                println!("[NODE] Balance: {} coins", bc.get_balance(addr).as_coins());
+            }     
+            
+
+            "send" => {
+                let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+                if parts.len() != 2 {
+                    println!("[SEND] Usage: send <to_address> <amount>");
+                    continue;
+                }
+                let to_address  = parts[0];
+                let amount: f64 = match parts[1].parse() {
+                    Ok(v) => v,
+                    Err(_) => { println!("[SEND] Invalid amount — use a decimal number e.g. 1.5"); continue; }
+                };
+
+                match create_and_broadcast_tx(
+                    &blockchain, &mempool, &known_hosts,
+                    &keypair, to_address, amount, my_port,
+                ) {
+                    Ok(tx_id) => println!("[SEND] Transaction broadcast: {}", tx_id),
+                    Err(e)    => eprintln!("[SEND] Failed: {}", e),
+                }
+            }            
+
             "mine" => {
-                if is_mining
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_err()
-                {
+                if is_mining.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
                     println!("[MINE] Already mining — please wait.");
                     continue;
                 }
 
-                let bc = Arc::clone(&blockchain);
-                let mp = Arc::clone(&mempool);
-                let hosts = Arc::clone(&known_hosts);
+                let bc          = Arc::clone(&blockchain);
+                let mp          = Arc::clone(&mempool);
+                let hosts       = Arc::clone(&known_hosts);
                 let mining_flag = Arc::clone(&is_mining);
-                let address = miner_address.clone();
-                let port = my_port;
+                let address     = keypair.get_public_key().to_string();
+                let port        = my_port;
 
                 thread::spawn(move || {
                     mine_block_async(bc, mp, hosts, mining_flag, address, port);
@@ -392,24 +423,21 @@ fn client_loop(
 
             "mempool" => {
                 let mp = mempool.read().unwrap();
-                println!("[CLIENT] Mempool: {} pending transactions", mp.len());
+                println!("[CLIENT] Mempool: {} pending transaction(s)", mp.len());
                 for tx in mp.iter() {
-                    println!(
-                        "  {} → {} : {} coins",
-                        &tx.from_address()[..16],
-                        &tx.to_address()[..16],
-                        tx.amount()
-                    );
+                    println!("  id={} | {}... → {}... | {} coins",
+                             &tx.id()[..12],
+                             &tx.from_address()[..16],
+                             &tx.to_address()[..16],
+                             tx.amount().as_coins());
                 }
             }
 
             "chain" => {
                 let bc = blockchain.read().unwrap();
-                println!(
-                    "[CLIENT] Local chain: {} block(s), tip={}...",
-                    bc.chain().len(),
-                    &bc.chain().last().map(|b| b.hash()).unwrap_or("none")[..16]
-                );
+                println!("[CLIENT] Local chain: {} block(s), tip={}...",
+                         bc.chain().len(),
+                         &bc.chain().last().map(|b| b.hash()).unwrap_or("none")[..16]);
                 drop(bc);
                 broadcast(&known_hosts, &Message::RequestChain, my_port);
             }
@@ -422,14 +450,68 @@ fn client_loop(
                 broadcast(&known_hosts, &Message::Ping { port: my_port }, my_port);
             }
 
-            other => {
-                println!(
-                    "[CLIENT] Unknown command '{}'. Try: mine | ping | chain | inventory | mempool | quit",
-                    other
-                );
+            _ => {
+                println!("[CLIENT] Unknown command '{}'. Try: send <to> <amount> | mine | whoami | ping | chain | inventory | mempool | quit", cmd);
             }
         }
     }
+}
+
+fn create_and_broadcast_tx(
+    blockchain:  &SharedBlockchain,
+    mempool:     &SharedMempool,
+    known_hosts: &SharedHosts,
+    keypair:     &KeyPair,
+    to_address:  &str,
+    amount:      f64,
+    my_port:     u16,
+) -> Result<String, String> {
+    let from_address = keypair.get_public_key();
+
+    let (available_balance, min_fee_rate) = {
+        let bc = blockchain.read().unwrap();
+        (bc.get_available_balance(from_address), bc.min_fee_rate())
+    };
+
+    let dummy = rust_blockchain::transaction::Transaction::new(from_address, to_address, amount, 0.0)
+    .map_err(|e| format!("invalid transaction parameters: {}", e))?;
+
+    let fee_satoshis = dummy.estimate_size() as u64 * min_fee_rate;
+    let fee_coins    = fee_satoshis as f64 / 100_000_000.0;
+
+    let total_cost = amount + fee_coins;
+    if total_cost > available_balance.as_coins() {
+        return Err(format!(
+            "insufficient balance — need {:.8} coins (amount {:.8} + fee {:.8}), have {:.8}",
+                           total_cost, amount, fee_coins, available_balance.as_coins()
+        ));
+    }
+
+    let mut tx = rust_blockchain::transaction::Transaction::new(from_address, to_address, amount, fee_coins)
+    .map_err(|e| format!("failed to create transaction: {}", e))?;
+
+    tx.sign(keypair.get_private_key())
+    .map_err(|e| format!("failed to sign transaction: {}", e))?;
+
+    println!("[SEND] Created tx {} — amount: {:.8} coins, fee: {:.8} coins",
+             &tx.id()[..16], amount, fee_coins);
+
+    {
+        let mut bc = blockchain.write().unwrap();
+        bc.add_transaction(tx.clone())
+        .map_err(|e| format!("transaction rejected by local node: {}", e))?;
+    }
+
+    {
+        let mut mp = mempool.write().unwrap();
+        mp.push(tx.clone());
+    }
+
+    let tx_id = tx.id().to_string();
+
+    broadcast(known_hosts, &Message::NewTransaction(tx), my_port);
+
+    Ok(tx_id)
 }
 
 fn mine_block_async(
@@ -495,7 +577,6 @@ fn mine_block_async(
     broadcast(&known_hosts, &Message::NewBlock(candidate), my_port);
 }
 
-// encode msg and send it to every known peer, printing the decoded response
 fn broadcast(known_hosts: &SharedHosts, msg: &Message, my_port: u16) {
     let peers: Vec<(String, u16)> = known_hosts.lock().unwrap().clone();
 
@@ -506,10 +587,7 @@ fn broadcast(known_hosts: &SharedHosts, msg: &Message, my_port: u16) {
 
     let payload = match encode(msg) {
         Ok(b) => b,
-        Err(e) => {
-            eprintln!("[CLIENT] Encode error: {}", e);
-            return;
-        }
+        Err(e) => { eprintln!("[CLIENT] Encode error: {}", e); return; }
     };
     let payload_str = String::from_utf8_lossy(&payload).to_string();
 
@@ -519,16 +597,13 @@ fn broadcast(known_hosts: &SharedHosts, msg: &Message, my_port: u16) {
             Ok(addr) => match client.request(addr, &payload_str) {
                 Ok(response) => match decode(response.trim_end().as_bytes()) {
                     Ok(Message::Pong { port }) if port != 0 => {
-                        println!(
-                            "[CLIENT] ← {}:{} Pong (their port: {})",
-                            ip, peer_port, port
-                        );
+                        println!("[CLIENT] ← {}:{} Pong (their port: {})", ip, peer_port, port);
                         register_host(known_hosts, ip.clone(), port);
                     }
                     Ok(reply) => println!("[CLIENT] ← {}:{} {:?}", ip, peer_port, reply),
-                    Err(_) => println!("[CLIENT] ← {}:{} (raw) {}", ip, peer_port, response),
+                    Err(_)    => println!("[CLIENT] ← {}:{} (raw) {}", ip, peer_port, response),
                 },
-                Err(e) => eprintln!("[CLIENT] ✗ {}:{} {}", ip, peer_port, e),
+                Err(e) => eprintln!("[CLIENT] ERROR: {}:{} {}", ip, peer_port, e),
             },
             Err(_) => eprintln!("[CLIENT] Invalid IP: {}", ip),
         }
