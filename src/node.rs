@@ -8,6 +8,7 @@ use rust_blockchain::{
 };
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use threadpool::ThreadPool;
@@ -22,6 +23,7 @@ pub struct Node {
     pub known_hosts: SharedHosts,
     pub keypair: KeyPair,
     pub port: u16,
+    pub is_mining: Arc<AtomicBool>,
 }
 
 impl Node {
@@ -32,6 +34,7 @@ impl Node {
             known_hosts: Arc::new(Mutex::new(Vec::new())),
             keypair,
             port,
+            is_mining: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -59,6 +62,8 @@ impl Node {
             Arc::clone(&self.blockchain),
             Arc::clone(&self.mempool),
             self.port,
+            Arc::clone(&self.is_mining),
+            self.keypair.get_public_key().to_string(),
         );
     }
 }
@@ -237,7 +242,7 @@ fn handle_message(
                 client_ip, length
             );
             let mut bc = blockchain.write().unwrap();
-            if bc.replace_chain(blocks) {
+            if bc.replace_chain_bootstrap(blocks) {
                 println!("[SYNC] Adopted network chain ({} blocks)", length);
             }
             Message::Pong { port: my_port }
@@ -346,9 +351,11 @@ fn client_loop(
     blockchain: SharedBlockchain,
     mempool: SharedMempool,
     my_port: u16,
+    is_mining: Arc<AtomicBool>,
+    miner_address: String,
 ) {
     let stdin = io::stdin();
-    println!("[CLIENT] Ready. Commands: ping | chain | inventory | mempool | quit");
+    println!("[CLIENT] Ready. Commands: ping | mine | chain | inventory | mempool | quit");
 
     for line in stdin.lock().lines() {
         let input = match line {
@@ -362,14 +369,35 @@ fn client_loop(
         match input.as_str() {
             "quit" => break,
 
+            "mine" => {
+                if is_mining
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    println!("[MINE] Already mining — please wait.");
+                    continue;
+                }
+
+                let bc = Arc::clone(&blockchain);
+                let mp = Arc::clone(&mempool);
+                let hosts = Arc::clone(&known_hosts);
+                let mining_flag = Arc::clone(&is_mining);
+                let address = miner_address.clone();
+                let port = my_port;
+
+                thread::spawn(move || {
+                    mine_block_async(bc, mp, hosts, mining_flag, address, port);
+                });
+            }
+
             "mempool" => {
                 let mp = mempool.read().unwrap();
                 println!("[CLIENT] Mempool: {} pending transactions", mp.len());
                 for tx in mp.iter() {
                     println!(
                         "  {} → {} : {} coins",
-                        tx.from_address(),
-                        tx.to_address(),
+                        &tx.from_address()[..16],
+                        &tx.to_address()[..16],
                         tx.amount()
                     );
                 }
@@ -378,9 +406,9 @@ fn client_loop(
             "chain" => {
                 let bc = blockchain.read().unwrap();
                 println!(
-                    "[CLIENT] Local chain: {} block(s), tip={}",
+                    "[CLIENT] Local chain: {} block(s), tip={}...",
                     bc.chain().len(),
-                    bc.chain().last().map(|b| &b.hash()[..12]).unwrap_or("none")
+                    &bc.chain().last().map(|b| b.hash()).unwrap_or("none")[..16]
                 );
                 drop(bc);
                 broadcast(&known_hosts, &Message::RequestChain, my_port);
@@ -396,12 +424,75 @@ fn client_loop(
 
             other => {
                 println!(
-                    "[CLIENT] Unknown command '{}'. Try: ping | chain | inventory | mempool | quit",
+                    "[CLIENT] Unknown command '{}'. Try: mine | ping | chain | inventory | mempool | quit",
                     other
                 );
             }
         }
     }
+}
+
+fn mine_block_async(
+    blockchain:    SharedBlockchain,
+    mempool:       SharedMempool,
+    known_hosts:   SharedHosts,
+    is_mining:     Arc<AtomicBool>,
+    miner_address: String,
+    my_port:       u16,
+) {
+    struct MiningGuard(Arc<AtomicBool>);
+    impl Drop for MiningGuard {
+        fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); }
+    }
+    let _guard = MiningGuard(Arc::clone(&is_mining));
+
+    println!("[MINE] Starting — draining mempool and preparing block...");
+
+    let (mut candidate, difficulty) = {
+        let mut bc = blockchain.write().unwrap();
+
+        let pending: Vec<Transaction> = {
+            let mut mp = mempool.write().unwrap();
+            mp.drain(..).collect()
+        };
+
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for tx in pending {
+            match bc.add_transaction(tx) {
+                Ok(_)  => accepted += 1,
+                Err(e) => { eprintln!("[MINE] Skipping invalid tx: {}", e); rejected += 1; }
+            }
+        }
+        println!("[MINE] Mempool drained — {} accepted, {} rejected", accepted, rejected);
+        println!("[MINE] Pending in block: {} tx(s)", bc.pending_transactions().len());
+
+        match bc.prepare_mining(miner_address) {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!("[MINE] Failed to prepare block: {}", e);
+                return;
+            }
+        }
+    };
+
+    println!("[MINE] Running PoW at difficulty {}...", difficulty);
+    candidate.mine_block(difficulty);
+    println!("[MINE] Block mined! hash={}...", &candidate.hash()[..20]);
+
+    {
+        let mut bc = blockchain.write().unwrap();
+        match bc.commit_mined_block(candidate.clone()) {
+            Ok(_) => println!("[MINE] Block committed — chain height: {}", bc.chain().len()),
+            Err(e) => {
+                eprintln!("[MINE] Commit failed (stale block?): {}", e);
+                return;
+            }
+        }
+    }
+
+    println!("[MINE] Broadcasting NewBlock to peers...");
+    broadcast(&known_hosts, &Message::NewBlock(candidate), my_port);
 }
 
 // encode msg and send it to every known peer, printing the decoded response
