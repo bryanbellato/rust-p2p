@@ -47,6 +47,13 @@ impl Node {
             }
         });
 
+        // give the server thread a moment to bind before we start sending.
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        // if we bootstrapped with known peers,
+        // we adopt the network's chain before accepting user input
+        startup_sync(&self.known_hosts, &self.blockchain, self.port);
+
         client_loop(
             Arc::clone(&self.known_hosts),
             Arc::clone(&self.blockchain),
@@ -257,6 +264,68 @@ fn register_host(known_hosts: &SharedHosts, ip: String, port: u16) {
     }
 }
 
+fn startup_sync(known_hosts: &SharedHosts, blockchain: &SharedBlockchain, my_port: u16) {
+    let peers: Vec<(String, u16)> = known_hosts.lock().unwrap().clone();
+
+    if peers.is_empty() {
+        println!("[SYNC] No peers to sync with — this node is the network origin.");
+        return;
+    }
+
+    println!(
+        "[SYNC] Starting up — syncing chain with {} known peer(s)...",
+        peers.len()
+    );
+
+    for (ip, peer_port) in &peers {
+        match ip.parse::<Ipv4Addr>() {
+            Ok(addr) => {
+                // announce our listening port so the peer can register us
+                let ping = Message::Ping { port: my_port };
+                if let Some(reply) = send_to_peer(addr, *peer_port, &ping) {
+                    println!("[SYNC] Ping → {}:{} got {:?}", ip, peer_port, reply);
+                }
+
+                // request their chain; the response handler will call
+                let req = Message::RequestChain;
+                if let Some(reply) = send_to_peer(addr, *peer_port, &req) {
+                    if let Message::ChainResponse { blocks, length } = reply {
+                        println!(
+                            "[SYNC] Got chain from {}:{} with {} block(s)",
+                            ip, peer_port, length
+                        );
+                        let mut bc = blockchain.write().unwrap();
+                        if bc.replace_chain_bootstrap(blocks) {
+                            println!(
+                                "[SYNC] Adopted network chain — genesis: {}...",
+                                &bc.chain()[0].hash()[..16]
+                            );
+                        } else {
+                            println!("[SYNC] Our chain is already up to date.");
+                        }
+                    }
+                }
+            }
+            Err(_) => eprintln!("[SYNC] Invalid peer IP: {}", ip),
+        }
+    }
+}
+
+// send a single message to a specific peer and return the decoded response
+// returns None on any network or encoding error
+fn send_to_peer(addr: Ipv4Addr, port: u16, msg: &Message) -> Option<Message> {
+    let payload = encode(msg).ok()?;
+    let payload_str = String::from_utf8_lossy(&payload).to_string();
+    let client = Client::new(port);
+    match client.request(addr, &payload_str) {
+        Ok(response) => decode(response.trim_end().as_bytes()).ok(),
+        Err(e) => {
+            eprintln!("[SYNC] ✗ {}:{} — {}", addr, port, e);
+            None
+        }
+    }
+}
+
 fn client_loop(
     known_hosts: SharedHosts,
     blockchain: SharedBlockchain,
@@ -292,6 +361,13 @@ fn client_loop(
             }
 
             "chain" => {
+                let bc = blockchain.read().unwrap();
+                println!(
+                    "[CLIENT] Local chain: {} block(s), tip={}",
+                    bc.chain().len(),
+                    bc.chain().last().map(|b| &b.hash()[..12]).unwrap_or("none")
+                );
+                drop(bc);
                 broadcast(&known_hosts, &Message::RequestChain, my_port);
             }
 
