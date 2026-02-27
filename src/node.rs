@@ -91,7 +91,7 @@ fn server_thread(
                 let bc = Arc::clone(&blockchain);
                 let mp = Arc::clone(&mempool);
                 let hosts = Arc::clone(&known_hosts);
-                pool.execute(move || handle_stream(stream, bc, mp, hosts));
+                pool.execute(move || handle_stream(stream, bc, mp, hosts, port));
             }
             Err(e) => eprintln!("[SERVER] Accept error: {}", e),
         }
@@ -104,6 +104,7 @@ fn handle_stream(
     blockchain: SharedBlockchain,
     mempool: SharedMempool,
     known_hosts: SharedHosts,
+    my_port: u16,
 ) {
     let client_ip = stream
         .peer_addr()
@@ -132,7 +133,14 @@ fn handle_stream(
 
         match decode(line.as_bytes()) {
             Ok(msg) => {
-                let response = handle_message(msg, &client_ip, &blockchain, &mempool, &known_hosts);
+                let response = handle_message(
+                    msg,
+                    &client_ip,
+                    &blockchain,
+                    &mempool,
+                    &known_hosts,
+                    my_port,
+                );
                 if let Ok(bytes) = encode(&response) {
                     let _ = writer.write_all(&bytes);
                 }
@@ -148,17 +156,24 @@ fn handle_message(
     blockchain: &SharedBlockchain,
     mempool: &SharedMempool,
     known_hosts: &SharedHosts,
+    my_port: u16,
 ) -> Message {
     match msg {
         Message::Ping { port } => {
             println!("[SERVER] Ping from {}:{}", client_ip, port);
             register_host(known_hosts, client_ip.to_string(), port);
-            Message::Pong { port: 0 } // wip: replace 0 with this node's own port
+            Message::Pong { port: my_port }
         }
 
         Message::Pong { port } => {
-            println!("[SERVER] Pong from {}:{}", client_ip, port);
-            Message::Pong { port: 0 }
+            if port != 0 {
+                println!(
+                    "[SERVER] Pong from {}:{} (their port: {})",
+                    client_ip, port, port
+                );
+                register_host(known_hosts, client_ip.to_string(), port);
+            }
+            Message::Pong { port: my_port }
         }
 
         Message::NewBlock(block) => {
@@ -174,7 +189,7 @@ fn handle_message(
             if bc.replace_chain(chain) {
                 println!("[SERVER] Chain updated from peer {}", client_ip);
             }
-            Message::Pong { port: 0 } // ack
+            Message::Pong { port: my_port }
         }
 
         Message::RequestBlock { index } => {
@@ -184,7 +199,7 @@ fn handle_message(
                 Some(block) => Message::Block(block.clone()),
                 None => {
                     eprintln!("[SERVER] Block {} not found", index);
-                    Message::Pong { port: 0 }
+                    Message::Pong { port: my_port }
                 }
             }
         }
@@ -195,7 +210,7 @@ fn handle_message(
                 client_ip,
                 block.hash()
             );
-            Message::Pong { port: 0 }
+            Message::Pong { port: my_port }
         }
 
         Message::NewTransaction(tx) => {
@@ -205,7 +220,7 @@ fn handle_message(
                 mp.push(tx);
                 println!("[SERVER] Transaction added to mempool (size={})", mp.len());
             }
-            Message::Pong { port: 0 }
+            Message::Pong { port: my_port }
         }
 
         Message::RequestChain => {
@@ -223,9 +238,9 @@ fn handle_message(
             );
             let mut bc = blockchain.write().unwrap();
             if bc.replace_chain(blocks) {
-                println!("[SERVER] Chain replaced with peer's longer chain");
+                println!("[SYNC] Adopted network chain ({} blocks)", length);
             }
-            Message::Pong { port: 0 }
+            Message::Pong { port: my_port }
         }
 
         Message::RequestInventory => {
@@ -251,7 +266,7 @@ fn handle_message(
                     println!("[SERVER] Missing block at index {}: {}", index, hash);
                 }
             }
-            Message::Pong { port: 0 }
+            Message::Pong { port: my_port }
         }
     }
 }
@@ -412,6 +427,13 @@ fn broadcast(known_hosts: &SharedHosts, msg: &Message, my_port: u16) {
         match ip.parse::<Ipv4Addr>() {
             Ok(addr) => match client.request(addr, &payload_str) {
                 Ok(response) => match decode(response.trim_end().as_bytes()) {
+                    Ok(Message::Pong { port }) if port != 0 => {
+                        println!(
+                            "[CLIENT] ← {}:{} Pong (their port: {})",
+                            ip, peer_port, port
+                        );
+                        register_host(known_hosts, ip.clone(), port);
+                    }
                     Ok(reply) => println!("[CLIENT] ← {}:{} {:?}", ip, peer_port, reply),
                     Err(_) => println!("[CLIENT] ← {}:{} (raw) {}", ip, peer_port, response),
                 },
